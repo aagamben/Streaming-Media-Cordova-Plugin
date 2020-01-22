@@ -1,5 +1,9 @@
 #import "StreamingMedia.h"
 #import <Cordova/CDV.h>
+#import <AVFoundation/AVFoundation.h>
+#import <AVKit/AVKit.h>
+#import "LandscapeVideo.h"
+#import "PortraitVideo.h"
 
 
 @interface StreamingMedia()
