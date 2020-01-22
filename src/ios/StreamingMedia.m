@@ -15,7 +15,7 @@
 
 @implementation StreamingMedia {
 	NSString* callbackId;
-	MPMoviePlayerController *moviePlayer;
+	AVPlayerViewController *moviePlayer;
 	BOOL shouldAutoClose;
 	UIColor *backgroundColor;
 	UIImageView *imageView;
@@ -25,6 +25,9 @@
     UIView *bannerView;
     UIButton *closeButton;
     UIButton *loadingText;
+    NSString *mOrientation;
+    NSString *videoType;
+    AVPlayer *movie;
 }
 
 NSString * const TYPE_VIDEO = @"VIDEO";
@@ -43,6 +46,8 @@ NSString * const ERROR_DONE = @"user terminated play";
 
 -(void)parseOptions:(NSDictionary *)options type:(NSString *) type {
     // Common options
+    mOrientation = options[@"orientation"] ?: @"default";
+	
     if (![options isKindOfClass:[NSNull class]] && [options objectForKey:@"shouldAutoClose"]) {
         shouldAutoClose = [[options objectForKey:@"shouldAutoClose"] boolValue];
     } else {
@@ -71,6 +76,8 @@ NSString * const ERROR_DONE = @"user terminated play";
     }
 
 	if ([type isEqualToString:TYPE_AUDIO]) {
+		videoType = TYPE_AUDIO;
+		
 		// bgImage
 		// bgImageScale
 		if (![options isKindOfClass:[NSNull class]] && [options objectForKey:@"bgImage"]) {
@@ -87,7 +94,11 @@ NSString * const ERROR_DONE = @"user terminated play";
 		} else {
 			backgroundColor = [UIColor blackColor];
 		}
+	} else {
+	    // Reset overlay on video player after playing audio
+	    [self cleanup];
 	}
+	
 	// No specific options for video yet
 }
 
@@ -280,104 +291,202 @@ NSString * const ERROR_DONE = @"user terminated play";
 }
 
 -(void)startPlayer:(NSString*)uri {
-	NSURL *url = [NSURL URLWithString:uri];
-
-    moviePlayer =  [[MPMoviePlayerController alloc] initWithContentURL:url];
-    [moviePlayer setScalingMode:MPMovieScalingModeAspectFit];
-
-    if (seek > 0) {
-        moviePlayer.initialPlaybackTime = seek / 1000.0;
+    NSLog(@"startplayer called");
+    NSURL *url             =  [NSURL URLWithString:uri];
+    movie                  =  [AVPlayer playerWithURL:url];
+    
+    // handle orientation
+    [self handleOrientation];
+    
+    // handle gestures
+    [self handleGestures];
+    
+    [moviePlayer setPlayer:movie];
+    [moviePlayer setShowsPlaybackControls:YES];
+    [moviePlayer setUpdatesNowPlayingInfoCenter:YES];
+    
+    if(@available(iOS 11.0, *)) { [moviePlayer setEntersFullScreenWhenPlaybackBegins:YES]; }
+    
+    // present modally so we get a close button
+    [self.viewController presentViewController:moviePlayer animated:YES completion:^(void){
+        [moviePlayer.player play];
+    }];
+    
+    // add audio image and background color
+    if ([videoType isEqualToString:TYPE_AUDIO]) {
+        if (imageView != nil) {
+            [moviePlayer.contentOverlayView setAutoresizesSubviews:YES];
+            [moviePlayer.contentOverlayView addSubview:imageView];
+        }
+        moviePlayer.contentOverlayView.backgroundColor = backgroundColor;
+        [self.viewController.view addSubview:moviePlayer.view];
     }
+    
+    // setup listners
+    [self handleListeners];
+}
 
-	// Listen for playback finishing
-	[[NSNotificationCenter defaultCenter] addObserver:self
-											 selector:@selector(moviePlayBackDidFinish:)
-												 name:MPMoviePlayerPlaybackDidFinishNotification
-											   object:moviePlayer];
-	// Listen for click on the "Done" button
-	[[NSNotificationCenter defaultCenter] addObserver:self
-											 selector:@selector(doneButtonClick:)
-												 name:MPMoviePlayerWillExitFullscreenNotification
-											   object:nil];
-	// Listen for orientation change
-	[[NSNotificationCenter defaultCenter] addObserver:self
-											 selector:@selector(orientationChanged:)
-												 name:UIDeviceOrientationDidChangeNotification
+- (void) handleListeners {
+    
+    // Listen for re-maximize
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(appDidBecomeActive:)
+                                                 name:UIApplicationDidBecomeActiveNotification
                                                object:nil];
-
-	// Listen for bufferring start/stop
-	[[NSNotificationCenter defaultCenter] addObserver:self
-											 selector:@selector(bufferStateChange:)
-												 name:MPMoviePlayerLoadStateDidChangeNotification
+    
+    // Listen for minimize
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(appDidEnterBackground:)
+                                                 name:UIApplicationDidEnterBackgroundNotification
                                                object:nil];
-
-	
     
-	moviePlayer.shouldAutoplay = YES;
-	if (imageView != nil) {
-		[moviePlayer.backgroundView setAutoresizesSubviews:YES];
-		[moviePlayer.backgroundView addSubview:imageView];
-	}
-	moviePlayer.backgroundView.backgroundColor = backgroundColor;
-	[self.viewController.view addSubview:moviePlayer.view];
+    // Listen for playback finishing
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(moviePlayBackDidFinish:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                               object:moviePlayer.player.currentItem];
     
-    CGRect parentFrame = self.viewController.view.frame;
-    if (mustWatch) {
-        bannerView = [[UIView alloc] initWithFrame:CGRectMake(80, parentFrame.size.height - 60, parentFrame.size.width - 80, 60)];
-        [bannerView setBackgroundColor:[UIColor clearColor]];
-        [self.viewController.view addSubview:bannerView];
-    }
-    closeButton = [[UIButton alloc] initWithFrame:CGRectMake(parentFrame.size.width-35, parentFrame.size.height - 38, 32, 32)];
-    [closeButton setTitle:@"X" forState:UIControlStateNormal];
-    [closeButton addTarget:self action:@selector(closeButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [closeButton setReversesTitleShadowWhenHighlighted:YES];
-    [self.viewController.view addSubview:closeButton];
+    // Listen for errors
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(moviePlayBackDidFinish:)
+                                                 name:AVPlayerItemFailedToPlayToEndTimeNotification
+                                               object:moviePlayer.player.currentItem];
     
-    loadingText = [[UIButton alloc] initWithFrame:CGRectMake((parentFrame.size.width/2)-60, (parentFrame.size.height/2)-30, 120, 32)];
-    [loadingText setTitle:@"Buffering..." forState:UIControlStateNormal];
-    [self.viewController.view addSubview:loadingText];
-
-
-	// Note: animating does a fade to black, which may not match background color
-    moviePlayer.view.frame = self.viewController.view.frame;
-    if (initFullscreen) {
-        [moviePlayer setFullscreen:YES animated:NO];
-    } else {
-        [moviePlayer setFullscreen:NO animated:NO];
-    }
+    // Listen for orientation change
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(orientationChanged:)
+                                                 name:UIDeviceOrientationDidChangeNotification
+                                               object:nil];
+    
+    /* Listen for click on the "Done" button
+     
+     // Deprecated.. AVPlayerController doesn't offer a "Done" listener... thanks apple. We'll listen for an error when playback finishes
+     [[NSNotificationCenter defaultCenter] addObserver:self
+     selector:@selector(doneButtonClick:)
+     name:MPMoviePlayerWillExitFullscreenNotification
+     object:nil];
+     */
 }
 
 - (void) closeButtonTapped: (id) sender {
     [self doneButtonClick:nil];
 }
 
-- (void) moviePlayBackDidFinish:(NSNotification*)notification {
-	NSDictionary *notificationUserInfo = [notification userInfo];
-	NSNumber *resultValue = [notificationUserInfo objectForKey:MPMoviePlayerPlaybackDidFinishReasonUserInfoKey];
-	MPMovieFinishReason reason = [resultValue intValue];
-	NSString *errorMsg;
-	if (reason == MPMovieFinishReasonPlaybackError) {
-		NSError *mediaPlayerError = [notificationUserInfo objectForKey:@"error"];
-		if (mediaPlayerError) {
-			errorMsg = [mediaPlayerError localizedDescription];
-		} else {
-			errorMsg = @"Unknown error.";
-		}
-		NSLog(@"Playback failed: %@", errorMsg);
-	}
+- (void) handleGestures {
+    // Get buried nested view
+    UIView *contentView = [moviePlayer.view valueForKey:@"contentView"];
+    
+    // loop through gestures, remove swipes
+    for (UIGestureRecognizer *recognizer in contentView.gestureRecognizers) {
+        NSLog(@"gesture loop ");
+        NSLog(@"%@", recognizer);
+        if ([recognizer isKindOfClass:[UIPanGestureRecognizer class]]) {
+            [contentView removeGestureRecognizer:recognizer];
+        }
+        if ([recognizer isKindOfClass:[UIPinchGestureRecognizer class]]) {
+            [contentView removeGestureRecognizer:recognizer];
+        }
+        if ([recognizer isKindOfClass:[UIRotationGestureRecognizer class]]) {
+            [contentView removeGestureRecognizer:recognizer];
+        }
+        if ([recognizer isKindOfClass:[UILongPressGestureRecognizer class]]) {
+            [contentView removeGestureRecognizer:recognizer];
+        }
+        if ([recognizer isKindOfClass:[UIScreenEdgePanGestureRecognizer class]]) {
+            [contentView removeGestureRecognizer:recognizer];
+        }
+        if ([recognizer isKindOfClass:[UISwipeGestureRecognizer class]]) {
+            [contentView removeGestureRecognizer:recognizer];
+        }
+    }
+}
 
-	if (shouldAutoClose || [errorMsg length] != 0) {
-		[self cleanup];
-		CDVPluginResult* pluginResult;
-		if ([errorMsg length] != 0) {
-			NSTimeInterval current = [moviePlayer currentPlaybackTime];
-			NSInteger mSec = current * 1000;
-			pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsDictionary:@{@"errMsg": ERROR_DONE, @"last": [NSNumber numberWithInteger:mSec]}];
-		} else {
-			pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsBool:true];
-		}
-		[self.commandDelegate sendPluginResult:pluginResult callbackId:callbackId];
-	}
+- (void) handleOrientation {
+    // hnadle the subclassing of the view based on the orientation variable
+    if ([mOrientation isEqualToString:@"landscape"]) {
+        moviePlayer            =  [[LandscapeAVPlayerViewController alloc] init];
+    } else if ([mOrientation isEqualToString:@"portrait"]) {
+        moviePlayer            =  [[PortraitAVPlayerViewController alloc] init];
+    } else {
+        moviePlayer            =  [[AVPlayerViewController alloc] init];
+    }
+}
+
+- (void) appDidEnterBackground:(NSNotification*)notification {
+    NSLog(@"appDidEnterBackground");
+    
+    if (moviePlayer && movie && videoType == TYPE_AUDIO)
+    {
+        NSLog(@"did set player layer to nil");
+        [moviePlayer setPlayer: nil];
+    }
+}
+
+- (void) appDidBecomeActive:(NSNotification*)notification {
+    NSLog(@"appDidBecomeActive");
+    
+    if (moviePlayer && movie && videoType == TYPE_AUDIO)
+    {
+        NSLog(@"did reinstate playerlayer");
+        [moviePlayer setPlayer:movie];
+    }
+}
+
+- (void) moviePlayBackDidFinish:(NSNotification*)notification {
+    NSLog(@"Playback did finish with auto close being %d, and error message being %@", shouldAutoClose, notification.userInfo);
+    NSDictionary *notificationUserInfo = [notification userInfo];
+    NSNumber *errorValue = [notificationUserInfo objectForKey:AVPlayerItemFailedToPlayToEndTimeErrorKey];
+    NSString *errorMsg;
+    if (errorValue) {
+        NSError *mediaPlayerError = [notificationUserInfo objectForKey:@"error"];
+        if (mediaPlayerError) {
+            errorMsg = [mediaPlayerError localizedDescription];
+        } else {
+            errorMsg = @"Unknown error.";
+        }
+        NSLog(@"Playback failed: %@", errorMsg);
+    }
+    
+    if (shouldAutoClose || [errorMsg length] != 0) {
+        [self cleanup];
+        CDVPluginResult* pluginResult;
+        if ([errorMsg length] != 0) {
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:errorMsg];
+        } else {
+            pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsBool:true];
+        }
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:callbackId];
+    }
+}
+
+
+- (void)cleanup {
+    NSLog(@"Clean up called");
+    imageView = nil;
+    initFullscreen = false;
+    backgroundColor = nil;
+    
+    // Remove playback finished listener
+    [[NSNotificationCenter defaultCenter]
+     removeObserver:self
+     name:AVPlayerItemDidPlayToEndTimeNotification
+     object:moviePlayer.player.currentItem];
+    // Remove playback finished error listener
+    [[NSNotificationCenter defaultCenter]
+     removeObserver:self
+     name:AVPlayerItemFailedToPlayToEndTimeNotification
+     object:moviePlayer.player.currentItem];
+    // Remove orientation change listener
+    [[NSNotificationCenter defaultCenter]
+     removeObserver:self
+     name:UIDeviceOrientationDidChangeNotification
+     object:nil];
+    
+    if (moviePlayer) {
+        [moviePlayer.player pause];
+        [moviePlayer dismissViewControllerAnimated:YES completion:nil];
+        moviePlayer = nil;
+    }
 }
 
 -(void)doneButtonClick:(NSNotification*)notification{
@@ -394,46 +503,4 @@ NSString * const ERROR_DONE = @"user terminated play";
     [self.commandDelegate sendPluginResult:pluginResult callbackId:callbackId];
 }
 
-
-- (void)cleanup {
-	NSLog(@"Clean up");
-	imageView = nil;
-    initFullscreen = false;
-	backgroundColor = nil;
-
-	// Remove Done Button listener
-	[[NSNotificationCenter defaultCenter]
-							removeObserver:self
-									  name:MPMoviePlayerWillExitFullscreenNotification
-									object:nil];
-	// Remove playback finished listener
-	[[NSNotificationCenter defaultCenter]
-							removeObserver:self
-									  name:MPMoviePlayerPlaybackDidFinishNotification
-									object:moviePlayer];
-	// Remove orientation change listener
-	[[NSNotificationCenter defaultCenter]
-							removeObserver:self
-									  name:UIDeviceOrientationDidChangeNotification
-									object:nil];
-	// Remove buffer state change listener
-	[[NSNotificationCenter defaultCenter]
-							removeObserver:self
-									  name:MPMoviePlayerLoadStateDidChangeNotification
-									object:nil];
-
-
-	if (moviePlayer) {
-		moviePlayer.fullscreen = NO;
-		[moviePlayer setInitialPlaybackTime:-1];
-		[moviePlayer stop];
-		moviePlayer.controlStyle = MPMovieControlStyleNone;
-		[moviePlayer.view removeFromSuperview];
-		moviePlayer = nil;
-        [closeButton removeFromSuperview];
-        closeButton = nil;
-        [loadingText removeFromSuperview];
-        loadingText = nil;
-	}
-}
 @end
